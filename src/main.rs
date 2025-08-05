@@ -1,3 +1,4 @@
+use clap::Parser;
 use scraper::{Html, Selector};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -8,6 +9,8 @@ use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use url::Url;
+
+mod cli;
 
 #[derive(Debug)]
 struct CrawlStats {
@@ -51,7 +54,7 @@ fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
     let base_url = match Url::parse(base_url_str) {
         Ok(url) => url,
         Err(e) => {
-            error!("[-] Could not parse base url {}: {}", base_url_str, e);
+            error!("[!] Could not parse base url {}: {}", base_url_str, e);
             return HashSet::new();
         }
     };
@@ -115,9 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let base_url = "https://crawler-test.com".to_string();
-    let crawl_limit = 1000;
-    const CONCURRENT_REQUESTS: usize = 20;
+    let cli = cli::Cli::parse();
+    let base_url = cli.url;
+    let crawl_limit = cli.max_pages;
+    let concurrent_requests = cli.concurrency;
 
     let state = Arc::new(CrawlState::new(base_url.clone()));
     let client = reqwest::Client::builder()
@@ -135,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        while tasks.len() < CONCURRENT_REQUESTS {
+        while tasks.len() < concurrent_requests {
             let mut queue = state.to_visit.lock().await;
             if queue.is_empty() {
                 break;
@@ -161,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(res) = tasks.join_next().await {
             if let Err(e) = res? {
-                error!("[-] Error during crawling: {}", e);
+                error!("[!] Error during crawling: {}", e);
             }
         }
     }
