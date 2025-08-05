@@ -51,7 +51,7 @@ fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
     let base_url = match Url::parse(base_url_str) {
         Ok(url) => url,
         Err(e) => {
-            error!("Could not parse base url {}: {}", base_url_str, e);
+            error!("[-] Could not parse base url {}: {}", base_url_str, e);
             return HashSet::new();
         }
     };
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(res) = tasks.join_next().await {
             if let Err(e) = res? {
-                error!("Error during crawling: {}", e);
+                error!("[-] Error during crawling: {}", e);
             }
         }
     }
