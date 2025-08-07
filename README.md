@@ -6,6 +6,8 @@
 cargo build --release
 ```
 
+## Usage
+
 ```sh
 Web Crawler
 
