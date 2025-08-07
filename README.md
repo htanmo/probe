@@ -1,6 +1,6 @@
 # probe
 
-## Build the 
+## Build the Project
 
 ```sh
 cargo build --release
