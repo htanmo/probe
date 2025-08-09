@@ -33,7 +33,7 @@ impl CrawlStats {
 
 #[derive(Debug)]
 struct CrawlState {
-    to_visit: Mutex<VecDeque<String>>,
+    to_visit: Mutex<VecDeque<(String, usize)>>,
     visited: Mutex<HashSet<String>>,
     stats: Mutex<CrawlStats>,
 }
@@ -41,7 +41,7 @@ struct CrawlState {
 impl CrawlState {
     fn new(base_url: String) -> Self {
         let mut to_visit = VecDeque::new();
-        to_visit.push_back(base_url);
+        to_visit.push_back((base_url, 0));
         Self {
             to_visit: Mutex::new(to_visit),
             visited: Mutex::new(HashSet::new()),
@@ -76,6 +76,7 @@ fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
 
 async fn crawl_task(
     url: String,
+    depth: usize,
     client: reqwest::Client,
     state: Arc<CrawlState>,
 ) -> Result<(), reqwest::Error> {
@@ -98,7 +99,7 @@ async fn crawl_task(
 
     let mut queue = state.to_visit.lock().await;
     for new_url in new_urls {
-        queue.push_back(new_url);
+        queue.push_back((new_url, depth + 1));
     }
     drop(queue);
 
@@ -122,11 +123,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_url = cli.url;
     let crawl_limit = cli.max_pages;
     let concurrent_requests = cli.concurrency;
+    let max_depth = cli.max_depth;
 
     let state = Arc::new(CrawlState::new(base_url.clone()));
     let client = reqwest::Client::builder()
         .user_agent("ProbeBot/1.0")
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(5))
         .build()?;
 
     let mut tasks = JoinSet::new();
@@ -144,11 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if queue.is_empty() {
                 break;
             }
-            let url = queue.pop_front().unwrap();
+            let (url, depth) = queue.pop_front().unwrap();
             drop(queue);
 
             let mut visited_set = state.visited.lock().await;
-            if visited_set.len() >= crawl_limit {
+            if visited_set.len() >= crawl_limit && depth <= max_depth {
                 if tasks.is_empty() {
                     break;
                 }
@@ -159,8 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             drop(visited_set);
 
-            info!("[+] {}", url);
-            tasks.spawn(crawl_task(url, client.clone(), Arc::clone(&state)));
+            info!("[+] {} at depth = {}", url, depth);
+            tasks.spawn(crawl_task(url, depth, client.clone(), Arc::clone(&state)));
         }
 
         if let Some(res) = tasks.join_next().await {
