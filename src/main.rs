@@ -35,7 +35,7 @@ struct CrawlState {
     to_visit: Mutex<VecDeque<(String, usize)>>,
     visited: RwLock<HashSet<String>>,
     stats: Mutex<CrawlStats>,
-    robots_cache: Mutex<HashMap<String, Vec<String>>>,
+    robots_cache: Mutex<HashMap<String, RobotsRules>>,
     domain_next_allowed: Mutex<HashMap<String, Instant>>,
 }
 
@@ -88,27 +88,49 @@ fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
         .collect()
 }
 
-async fn fetch_robots_for_domain(client: &reqwest::Client, domain_base: &Url) -> Vec<String> {
+async fn fetch_robots_for_domain(client: &reqwest::Client, domain_base: &Url) -> RobotsRules {
     let robots_url = match domain_base.join("/robots.txt") {
         Ok(u) => u,
-        Err(_) => return vec![],
+        Err(_) => {
+            return RobotsRules {
+                allows: vec![],
+                disallows: vec![],
+            };
+        }
     };
 
     match client.get(robots_url.as_str()).send().await {
         Ok(resp) => match resp.status() {
             StatusCode::OK => match resp.text().await {
                 Ok(text) => parse_robots_txt(&text),
-                Err(_) => vec![],
+                Err(_) => RobotsRules {
+                    allows: vec![],
+                    disallows: vec![],
+                },
             },
-            _ => vec![],
+            _ => RobotsRules {
+                allows: vec![],
+                disallows: vec![],
+            },
         },
-        Err(_) => vec![],
+        Err(_) => RobotsRules {
+            allows: vec![],
+            disallows: vec![],
+        },
     }
 }
 
-fn parse_robots_txt(text: &str) -> Vec<String> {
+#[derive(Debug, Clone)]
+struct RobotsRules {
+    allows: Vec<String>,
+    disallows: Vec<String>,
+}
+
+fn parse_robots_txt(text: &str) -> RobotsRules {
     let mut disallows = Vec::new();
+    let mut allows = Vec::new();
     let mut applicable = false;
+
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -118,6 +140,7 @@ fn parse_robots_txt(text: &str) -> Vec<String> {
         if parts.len() != 2 {
             continue;
         }
+
         let (key, value) = (parts[0].to_lowercase(), parts[1]);
         match key.as_str() {
             "user-agent" => {
@@ -129,12 +152,15 @@ fn parse_robots_txt(text: &str) -> Vec<String> {
                 }
             }
             "allow" => {
-                // TODO: allowed url
+                if applicable && !value.is_empty() {
+                    allows.push(value.to_string());
+                }
             }
             _ => {}
         }
     }
-    disallows
+
+    RobotsRules { allows, disallows }
 }
 
 async fn is_allowed_by_robots(
@@ -147,31 +173,32 @@ async fn is_allowed_by_robots(
         None => return true,
     };
 
-    {
+    let rules = {
         let cache = state.robots_cache.lock().await;
-        if let Some(disallows) = cache.get(&domain) {
-            for prefix in disallows {
-                if url.path().starts_with(prefix) {
-                    debug!("robots disallow {} -> {}", url, prefix);
-                    return false;
-                }
-            }
-            return true;
+        cache.get(&domain).cloned()
+    };
+
+    let rules = match rules {
+        Some(r) => r,
+        None => {
+            let fetched = fetch_robots_for_domain(client, url).await;
+            let mut cache = state.robots_cache.lock().await;
+            cache.insert(domain.clone(), fetched.clone());
+            fetched
         }
+    };
+
+    if rules.allows.iter().any(|p| url.path().starts_with(p)) {
+        return true;
     }
 
-    let disallows = fetch_robots_for_domain(client, url).await;
-    {
-        let mut cache = state.robots_cache.lock().await;
-        cache.insert(domain.clone(), disallows.clone());
-    }
-
-    for prefix in disallows {
+    for prefix in rules.disallows {
         if url.path().starts_with(&prefix) {
             debug!("robots disallow {} -> {}", url, prefix);
             return false;
         }
     }
+
     true
 }
 
