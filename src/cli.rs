@@ -1,18 +1,33 @@
-use clap::{Parser, command};
+use clap::Parser;
 
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[derive(Parser, Debug)]
+#[clap(version, about)]
 pub struct Cli {
-    /// Starting URL for the crawler.
-    #[arg(short, long, required = true, value_name = "URL")]
+    /// The seed URL to start crawling from
+    #[clap(long, short)]
     pub url: String,
-    /// Number of parallel requests to run at once.
-    #[arg(short, long, default_value_t = 10, value_name = "NUMBER")]
-    pub concurrency: usize,
-    /// Maximum Depth to crawl
-    #[arg(short = 'd', long, default_value_t = 3, value_name = "DEPTH")]
-    pub max_depth: usize,
-    /// Maximum total number of pages to visit.
-    #[arg(short = 'n', long, default_value_t = 100, value_name = "PAGES")]
+
+    /// Maximum number of pages to visit (unique)
+    #[clap(long, short = 'n', default_value = "200")]
     pub max_pages: usize,
+
+    /// Maximum number of concurrent requests
+    #[clap(long, short = 'c', default_value = "20")]
+    pub concurrency: usize,
+
+    /// Maximum depth from the seed (seed depth = 0)
+    #[clap(long, default_value = "5")]
+    pub max_depth: usize,
+
+    /// Delay between requests per-domain in milliseconds (politeness)
+    #[clap(long, default_value = "250")]
+    pub delay_ms: u64,
+
+    /// Respect robots.txt (defaults to true)
+    #[clap(long, default_value = "true")]
+    pub obey_robots: bool,
+
+    /// Output JSON report file
+    #[clap(long, default_value = "crawl_report.json")]
+    pub report: String,
 }

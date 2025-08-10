@@ -1,12 +1,11 @@
 use clap::Parser;
+use reqwest::StatusCode;
 use scraper::{Html, Selector};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tokio::task::JoinSet;
-use tracing::level_filters::LevelFilter;
-use tracing::{error, info};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use url::Url;
 
@@ -14,9 +13,9 @@ mod cli;
 
 #[derive(Debug)]
 struct CrawlStats {
-    successful_requests: u32,
-    failed_requests: u32,
-    total_urls_found: usize,
+    successful_requests: u64,
+    failed_requests: u64,
+    total_urls_found: u64,
     start_time: Instant,
 }
 
@@ -34,39 +33,54 @@ impl CrawlStats {
 #[derive(Debug)]
 struct CrawlState {
     to_visit: Mutex<VecDeque<(String, usize)>>,
-    visited: Mutex<HashSet<String>>,
+    visited: RwLock<HashSet<String>>,
     stats: Mutex<CrawlStats>,
+    robots_cache: Mutex<HashMap<String, Vec<String>>>,
+    domain_next_allowed: Mutex<HashMap<String, Instant>>,
 }
 
 impl CrawlState {
-    fn new(base_url: String) -> Self {
-        let mut to_visit = VecDeque::new();
-        to_visit.push_back((base_url, 0));
+    fn new(seed: String) -> Self {
+        let mut dq = VecDeque::new();
+        dq.push_back((seed, 0));
         Self {
-            to_visit: Mutex::new(to_visit),
-            visited: Mutex::new(HashSet::new()),
+            to_visit: Mutex::new(dq),
+            visited: RwLock::new(HashSet::new()),
             stats: Mutex::new(CrawlStats::new()),
+            robots_cache: Mutex::new(HashMap::new()),
+            domain_next_allowed: Mutex::new(HashMap::new()),
         }
     }
 }
 
 fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
     let base_url = match Url::parse(base_url_str) {
-        Ok(url) => url,
+        Ok(u) => u,
         Err(e) => {
-            error!("[!] Could not parse base url {}: {}", base_url_str, e);
-            return HashSet::new();
+            error!("Could not parse base url {}: {}", base_url_str, e);
+            return Default::default();
         }
     };
-    let base_domain = base_url.domain().unwrap_or_default();
+    let base_domain = base_url.domain().map(|d| d.to_string());
+
     let document = Html::parse_document(html_body);
-    let selector = Selector::parse("a[href]").unwrap();
+    let selector = match Selector::parse("a[href]") {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Selector parse error: {}", e);
+            return Default::default();
+        }
+    };
 
     document
         .select(&selector)
-        .filter_map(|element| element.value().attr("href"))
+        .filter_map(|el| el.value().attr("href"))
         .filter_map(|href| base_url.join(href).ok())
-        .filter(|url| url.domain().unwrap_or_default() == base_domain)
+        .filter(|url| url.scheme().starts_with("http"))
+        .filter(|url| match (&base_domain, url.domain()) {
+            (Some(base), Some(domain)) => domain == base,
+            _ => false,
+        })
         .map(|mut url| {
             url.set_fragment(None);
             url.to_string()
@@ -74,114 +88,308 @@ fn find_all_urls(base_url_str: &str, html_body: &str) -> HashSet<String> {
         .collect()
 }
 
-async fn crawl_task(
+async fn fetch_robots_for_domain(client: &reqwest::Client, domain_base: &Url) -> Vec<String> {
+    let robots_url = match domain_base.join("/robots.txt") {
+        Ok(u) => u,
+        Err(_) => return vec![],
+    };
+
+    match client.get(robots_url.as_str()).send().await {
+        Ok(resp) => match resp.status() {
+            StatusCode::OK => match resp.text().await {
+                Ok(text) => parse_robots_txt(&text),
+                Err(_) => vec![],
+            },
+            _ => vec![],
+        },
+        Err(_) => vec![],
+    }
+}
+
+fn parse_robots_txt(text: &str) -> Vec<String> {
+    let mut disallows = Vec::new();
+    let mut applicable = false;
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, ':').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (key, value) = (parts[0].to_lowercase(), parts[1]);
+        match key.as_str() {
+            "user-agent" => {
+                applicable = value == "*";
+            }
+            "disallow" => {
+                if applicable && !value.is_empty() {
+                    disallows.push(value.to_string());
+                }
+            }
+            "allow" => {
+                // TODO: allowed url
+            }
+            _ => {}
+        }
+    }
+    disallows
+}
+
+async fn is_allowed_by_robots(
+    state: &Arc<CrawlState>,
+    client: &reqwest::Client,
+    url: &Url,
+) -> bool {
+    let domain = match url.domain() {
+        Some(d) => d.to_string(),
+        None => return true,
+    };
+
+    {
+        let cache = state.robots_cache.lock().await;
+        if let Some(disallows) = cache.get(&domain) {
+            for prefix in disallows {
+                if url.path().starts_with(prefix) {
+                    debug!("robots disallow {} -> {}", url, prefix);
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    let disallows = fetch_robots_for_domain(client, url).await;
+    {
+        let mut cache = state.robots_cache.lock().await;
+        cache.insert(domain.clone(), disallows.clone());
+    }
+
+    for prefix in disallows {
+        if url.path().starts_with(&prefix) {
+            debug!("robots disallow {} -> {}", url, prefix);
+            return false;
+        }
+    }
+    true
+}
+
+async fn wait_for_politeness(state: &Arc<CrawlState>, domain: &str, delay_ms: u64) {
+    let mut map = state.domain_next_allowed.lock().await;
+    let now = Instant::now();
+    if let Some(next) = map.get(domain) {
+        if *next > now {
+            let sleep_dur = *next - now;
+            tokio::time::sleep(sleep_dur).await;
+        }
+    }
+    map.insert(
+        domain.to_string(),
+        Instant::now() + Duration::from_millis(delay_ms),
+    );
+}
+
+async fn process_url(
+    client: reqwest::Client,
     url: String,
     depth: usize,
-    client: reqwest::Client,
     state: Arc<CrawlState>,
-) -> Result<(), reqwest::Error> {
-    let resp = client.get(&url).send().await?;
+    max_depth: usize,
+    max_pages: usize,
+    delay_ms: u64,
+    obey_robots: bool,
+) {
+    let parsed = match Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("Skipping invalid URL {}: {}", url, e);
+            let mut stats = state.stats.lock().await;
+            stats.failed_requests += 1;
+            return;
+        }
+    };
 
-    if !resp.status().is_success() {
-        error!(
-            "[-] Request to {} failed with status: {}",
-            url,
-            resp.status()
-        );
-        let mut stats = state.stats.lock().await;
-        stats.failed_requests += 1;
-        return Ok(());
+    if obey_robots {
+        if !is_allowed_by_robots(&state, &client, &parsed).await {
+            info!("Blocked by robots.txt: {}", url);
+            let mut stats = state.stats.lock().await;
+            stats.failed_requests += 1;
+            return;
+        }
     }
 
-    let body = resp.text().await?;
-    let new_urls = find_all_urls(&url, &body);
-    let new_urls_count = new_urls.len();
-
-    let mut queue = state.to_visit.lock().await;
-    for new_url in new_urls {
-        queue.push_back((new_url, depth + 1));
+    if let Some(domain) = parsed.domain() {
+        wait_for_politeness(&state, domain, delay_ms).await;
     }
-    drop(queue);
 
-    let mut stats = state.stats.lock().await;
-    stats.successful_requests += 1;
-    stats.total_urls_found += new_urls_count;
+    info!("Fetching {} (depth={})", url, depth);
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                warn!("Non-success status {} for {}", status, url);
+                let mut stats = state.stats.lock().await;
+                stats.failed_requests += 1;
+                return;
+            }
+            match resp.text().await {
+                Ok(body) => {
+                    let new_urls = find_all_urls(&url, &body);
+                    let new_count = new_urls.len();
 
-    Ok(())
+                    {
+                        let mut stats = state.stats.lock().await;
+                        stats.successful_requests += 1;
+                        stats.total_urls_found += new_count as u64;
+                    }
+
+                    if depth + 1 <= max_depth {
+                        let mut q = state.to_visit.lock().await;
+                        let visited_read = state.visited.read().await;
+                        for u in new_urls {
+                            if visited_read.contains(&u) {
+                                continue;
+                            }
+                            if visited_read.len() + q.len() >= max_pages {
+                                break;
+                            }
+                            q.push_back((u, depth + 1));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read body {}: {}", url, e);
+                    let mut stats = state.stats.lock().await;
+                    stats.failed_requests += 1;
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Request error for {}: {}", url, e);
+            let mut stats = state.stats.lock().await;
+            stats.failed_requests += 1;
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EnvFilter::builder()
-        .with_env_var("PROBE_LOG")
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
 
     let cli = cli::Cli::parse();
-    let base_url = cli.url;
-    let crawl_limit = cli.max_pages;
-    let concurrent_requests = cli.concurrency;
-    let max_depth = cli.max_depth;
+    let seed = cli.url.clone();
 
-    let state = Arc::new(CrawlState::new(base_url.clone()));
+    let seed_url = Url::parse(&seed)?;
+    if !seed_url.scheme().starts_with("http") {
+        return Err("Seed URL must be http or https".into());
+    }
+
+    let state = Arc::new(CrawlState::new(seed.clone()));
+
     let client = reqwest::Client::builder()
-        .user_agent("ProbeBot/1.0")
+        .user_agent("ProbeBot/1.0 (+https://example.com/bot)")
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    let mut tasks = JoinSet::new();
+    let semaphore = Arc::new(Semaphore::new(cli.concurrency));
 
-    info!("[+] BASE URL: {}", base_url);
+    info!(
+        "Starting crawl: {} | max_pages={} | concurrency={} | max_depth={} | delay_ms={} | obey_robots={}",
+        seed, cli.max_pages, cli.concurrency, cli.max_depth, cli.delay_ms, cli.obey_robots
+    );
 
     loop {
-        let queue_is_empty = state.to_visit.lock().await.is_empty();
-        if queue_is_empty && tasks.is_empty() {
+        let visited_count = { state.visited.read().await.len() };
+        if visited_count >= cli.max_pages {
+            info!("Reached max_pages limit: {}", visited_count);
             break;
         }
 
-        while tasks.len() < concurrent_requests {
-            let mut queue = state.to_visit.lock().await;
-            if queue.is_empty() {
-                break;
-            }
-            let (url, depth) = queue.pop_front().unwrap();
-            drop(queue);
+        let next_job = {
+            let mut q = state.to_visit.lock().await;
+            q.pop_front()
+        };
 
-            let mut visited_set = state.visited.lock().await;
-            if visited_set.len() >= crawl_limit && depth <= max_depth {
-                if tasks.is_empty() {
+        let job = match next_job {
+            Some((url, depth)) => (url, depth),
+            None => {
+                if Arc::strong_count(&semaphore) == 1 {
                     break;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
+            }
+        };
+
+        {
+            let visited_read = state.visited.read().await;
+            if visited_read.contains(&job.0) {
                 continue;
             }
-            if !visited_set.insert(url.clone()) {
+            if visited_read.len() >= cli.max_pages || job.1 > cli.max_depth {
                 continue;
             }
-            drop(visited_set);
-
-            info!("[+] {} at depth = {}", url, depth);
-            tasks.spawn(crawl_task(url, depth, client.clone(), Arc::clone(&state)));
         }
 
-        if let Some(res) = tasks.join_next().await {
-            if let Err(e) = res? {
-                error!("[!] Error during crawling: {}", e);
+        {
+            let mut visited_write = state.visited.write().await;
+            if !visited_write.insert(job.0.clone()) {
+                continue;
             }
         }
+
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let client_cl = client.clone();
+        let state_cl = Arc::clone(&state);
+        let url_cl = job.0.clone();
+        let depth_cl = job.1;
+        let max_depth = cli.max_depth;
+        let max_pages = cli.max_pages;
+        let delay_ms = cli.delay_ms;
+        let obey_robots = cli.obey_robots;
+
+        tokio::spawn(async move {
+            process_url(
+                client_cl,
+                url_cl,
+                depth_cl,
+                state_cl,
+                max_depth,
+                max_pages,
+                delay_ms,
+                obey_robots,
+            )
+            .await;
+            drop(permit);
+        });
     }
 
-    let stats = state.stats.lock().await;
-    let visited_count = state.visited.lock().await.len();
-    let total_duration = stats.start_time.elapsed();
+    let _ = semaphore.acquire_many(cli.concurrency as u32).await;
 
-    info!("[+] Crawl Finished");
-    info!("[=] Total time: {:.2?}", total_duration);
-    info!("[=] Visited {} unique URLs.", visited_count);
-    info!("[=] Successful requests: {}", stats.successful_requests);
-    info!("[=] Failed requests: {}", stats.failed_requests);
-    info!("[=] Total URLs found: {}", stats.total_urls_found);
+    let stats = state.stats.lock().await;
+    let visited_final = state.visited.read().await.len();
+    let duration = stats.start_time.elapsed();
+
+    let report = serde_json::json!({
+        "seed": seed,
+        "duration_seconds": duration.as_secs_f64(),
+        "visited_unique_urls": visited_final,
+        "successful_requests": stats.successful_requests,
+        "failed_requests": stats.failed_requests,
+        "total_urls_found": stats.total_urls_found,
+    });
+
+    let report_str = serde_json::to_string_pretty(&report)?;
+    tokio::fs::write(&cli.report, report_str).await?;
+
+    info!(
+        "Crawl finished. Visited {} urls in {:.2?}. Report written to {}",
+        visited_final, duration, cli.report
+    );
 
     Ok(())
 }
