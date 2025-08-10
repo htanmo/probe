@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[clap(version, about)]
+#[command(version, about, long_about = None)]
 pub struct Cli {
     /// The seed URL to start crawling from
     #[clap(long, short)]
