@@ -28,6 +28,6 @@ pub struct Cli {
     pub obey_robots: bool,
 
     /// Output JSON report file
-    #[clap(long, default_value = "crawl_report.json")]
+    #[clap(long, default_value = "report.json")]
     pub report: String,
 }

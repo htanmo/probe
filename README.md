@@ -20,7 +20,7 @@ Options:
       --max-depth <MAX_DEPTH>      Maximum depth from the seed (seed depth = 0) [default: 5]
       --delay-ms <DELAY_MS>        Delay between requests per-domain in milliseconds (politeness) [default: 250]
       --obey-robots                Respect robots.txt (defaults to false)
-      --report <REPORT>            Output JSON report file [default: crawl_report.json]
+      --report <REPORT>            Output JSON report file [default: report.json]
   -h, --help                       Print help
   -V, --version                    Print version
 ```
